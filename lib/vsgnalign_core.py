@@ -34,10 +34,11 @@ except Exception:
 from pyrevit import revit, forms
 
 __author__ = "Tu Thanh Nhan"
+__version__ = "1.103"   # +0.001 per release; after 1.199 -> 2.000
 
 EPS = 1e-9
 MM_TO_FT = 1.0 / 304.8
-GAP_RATIO = 0.10      # gap = 10% of the text height (Stack Vertical, Untangle)
+GAP_RATIO = 0.15      # gap = 15% of the text height (Stack Vertical, Untangle)
 LAYOUT_TOL = 1e-4     # ft (~0.03 mm) - layout is considered settled below this
 LAYOUT_MAX_PASSES = 4 # measure -> move -> re-measure passes
 TITLE = "Vsgn-Align"
@@ -625,25 +626,56 @@ def _glyph_top(item, ts):
     return item.max_y - _glyph_pad(item, ts)
 
 
-def _place_sequence(seq, direction, start, gap, sizes):
-    """Vertical: gap measured between the visible letters (box padding removed).
-    Horizontal: gap measured between the text boxes."""
+def _glyph_bottom(item, ts):
+    return item.min_y + _glyph_pad(item, ts)
+
+
+def _align_target(items, align, sizes):
+    """Fixed edge the texts are lined up to (computed once, before moving)."""
+    if align == "left":
+        return min(i.min_x for i in items)
+    if align == "right":
+        return max(i.max_x for i in items)
+    if align == "top":
+        return max(_glyph_top(i, sizes.get(_key(i.element))) for i in items)
+    if align == "bottom":
+        return min(_glyph_bottom(i, sizes.get(_key(i.element))) for i in items)
+    return None
+
+
+def _place_sequence(seq, direction, start, gap, sizes, align=None, target=None):
+    """Vertical: gap measured between the visible letters (box padding removed);
+    optional align left / right lines the texts up on one edge.
+    Horizontal: gap measured between the text boxes; optional align top / bottom."""
     cursor = start
     if direction == "vertical":
         for i in seq:
             ts = sizes.get(_key(i.element))
             pad = _glyph_pad(i, ts)
-            i.dx, i.dy = 0.0, cursor - (i.max_y - pad)
+            i.dy = cursor - (i.max_y - pad)
+            if align == "left":
+                i.dx = target - i.min_x
+            elif align == "right":
+                i.dx = target - i.max_x
+            else:
+                i.dx = 0.0
             cursor -= (i.h - 2.0 * pad) + gap
     else:
         for i in seq:
-            i.dx, i.dy = cursor - i.min_x, 0.0
+            ts = sizes.get(_key(i.element))
+            i.dx = cursor - i.min_x
+            if align == "top":
+                i.dy = target - _glyph_top(i, ts)
+            elif align == "bottom":
+                i.dy = target - _glyph_bottom(i, ts)
+            else:
+                i.dy = 0.0
             cursor += i.w + gap
 
 
-def _sequence_layout(doc, view, frame, items, order, direction, name):
+def _sequence_layout(doc, view, frame, items, order, direction, name, align=None):
     """Place items one after another (top-down or left-right) in the given order
-    with gap = 10% of the largest text height (2 mm text -> 0.2 mm between the
+    with gap = 15% of the largest text height (2 mm text -> 0.3 mm between the
     letters on paper). After each pass the real sizes are
     re-measured and the layout is corrected, so texts never overlap even when a
     spot / tag changes its text box after its leader moves."""
@@ -654,6 +686,7 @@ def _sequence_layout(doc, view, frame, items, order, direction, name):
         start = max(_glyph_top(i, sizes[_key(i.element)]) for i in items)
     else:
         start = min(i.min_x for i in items)
+    target = _align_target(items, align, sizes)
     order_keys = [_key(i.element) for i in order]
     elements = [i.element for i in items]
     failed, spot_failed = set(), set()
@@ -665,7 +698,7 @@ def _sequence_layout(doc, view, frame, items, order, direction, name):
         for _ in range(LAYOUT_MAX_PASSES):
             by_key = dict((_key(i.element), i) for i in current)
             seq = [by_key[k] for k in order_keys if k in by_key]
-            _place_sequence(seq, direction, start, gap, sizes)
+            _place_sequence(seq, direction, start, gap, sizes, align, target)
             moving = [i for i in seq
                       if (abs(i.dx) > LAYOUT_TOL or abs(i.dy) > LAYOUT_TOL)
                       and _key(i.element) not in failed
@@ -775,8 +808,9 @@ def anchor_of(doc, e, view, frame):
 # --------------------------------------------------------------------------
 # Untangle: reorder tags / spots so leaders do not cross
 # --------------------------------------------------------------------------
-def untangle(direction):
-    """direction: vertical (column of labels) | horizontal (row of labels)"""
+def untangle(direction, align=None):
+    """direction: vertical (column of labels) | horizontal (row of labels)
+    align: None, or 'left' / 'right' for vertical, 'top' / 'bottom' for horizontal."""
     res = _collect("Select tags or spot elevations to untangle, then click Finish",
                    2, annotations_only=True)
     if res is None:
@@ -795,8 +829,10 @@ def untangle(direction):
     else:
         # leader targets left -> right, texts lined up from the left edge of the group
         order = sorted(items, key=lambda i: i.anchor[0])
-    _sequence_layout(doc, view, frame, items, order, direction,
-                     "Vsgn-Align - Untangle " + direction.capitalize())
+    name = "Vsgn-Align - Untangle " + direction.capitalize()
+    if align:
+        name += " + Align " + align.capitalize()
+    _sequence_layout(doc, view, frame, items, order, direction, name, align)
 
 
 # --------------------------------------------------------------------------
