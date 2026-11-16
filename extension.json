@@ -1,0 +1,12 @@
+{
+  "type": "extension",
+  "rocket_mode_compatible": true,
+  "name": "VsgnAlign",
+  "description": "Vsgn-Align - align, distribute, stack, untangle and arrange elements, tags, text notes and spot elevations in Revit.",
+  "author": "Tu Thanh Nhan",
+  "author_profile": "",
+  "url": "",
+  "website": "",
+  "image": "",
+  "dependencies": []
+}
