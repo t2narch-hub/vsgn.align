@@ -1,5 +1,0 @@
-title: "Untangle Vertical"
-tooltip: |
-  Reorder a column of tags / spot elevations so their leaders do not cross,
-  then stack the texts with a gap of 10% of the text height.
-author: Tu Thanh Nhan
