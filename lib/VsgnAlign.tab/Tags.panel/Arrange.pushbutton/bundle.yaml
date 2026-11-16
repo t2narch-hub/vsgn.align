@@ -1,0 +1,5 @@
+title: "Arrange"
+tooltip: |
+  Arrange tags neatly around the view crop region without crossing leaders.
+  Select tags first to arrange only those, or select nothing to arrange every tag in the view.
+author: Tu Thanh Nhan
