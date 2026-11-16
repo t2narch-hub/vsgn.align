@@ -1,6 +1,7 @@
 # Vsgn-Align – pyRevit extension
 
-**Author:** Tu Thanh Nhan
+**Author:** Tu Thanh Nhan  
+**Version:** 1.102
 
 Align, distribute, stack, untangle and arrange model elements, tags, text notes,
 spot elevations and viewports in Revit.
@@ -21,15 +22,18 @@ spot elevations and viewports in Revit.
 | Panel | Command | Description |
 |---|---|---|
 | Tags | Arrange | Place tags around the view crop region (Left & Right / Top & Bottom / All sides) |
-| Tags | Untangle Vertical / Horizontal | Reorder tags or spot elevations so their leaders do not cross, then space the texts 0.2 mm apart |
-| Tags | About | Show Revit / pyRevit / Python versions (include it when reporting problems) |
+| Tags | Untangle Vertical / Horizontal | Reorder tags or spot elevations so their leaders do not cross, then space the texts 10% of the text height apart |
+| Tags | About | Show Vsgn-Align version, author and Revit version (include it when reporting problems) |
 
 Select elements first and click a command, or click a command, pick elements and press **Finish**.
 
 Notes:
 * Tags and text notes are measured **without their leaders**, so the text itself is aligned.
 * Tags move through *TagHeadPosition*; leader elbows move with the text, attached or free leader ends stay.
-* Stack Vertical and Untangle use a 0.2 mm paper gap (scaled by the view scale).
+* Stack Vertical and Untangle never overlap texts; the gap is 10% of the text height
+  (type *Text Size* x view scale, or the measured height for tags). Vertically the gap is
+  measured between the visible letters: 2 mm text -> 0.2 mm on paper. Sizes are re-measured
+  after each move and corrected automatically.
 * **Spot elevations / coordinates / slopes**: only the text moves (leader end and shoulder);
   the measured point never moves, so the value stays correct. Requires Revit 2021 or newer.
 * Pinned and grouped elements are skipped.
@@ -52,6 +56,14 @@ Click **pyRevit ▸ Update**, or run `pyrevit extensions update VsgnAlign`.
 ```bat
 pyrevit extensions delete VsgnAlign
 ```
+
+## Changelog
+
+* **1.102** – Vertical gap measured between the visible letters, not the Revit text box (2 mm text -> 0.2 mm gap on paper).
+* **1.101** – Stack Vertical / Untangle: no overlapping texts, gap = 10% of the text height, re-measure and correct after moving.
+* **1.100** – First versioned release: align, distribute, stack (0.2 mm), untangle (0.2 mm), arrange; spot elevation support.
+
+Versioning: each release adds 0.001; after 1.199 the next release is 2.000.
 
 ## Credits
 

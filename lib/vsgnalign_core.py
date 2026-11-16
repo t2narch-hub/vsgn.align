@@ -15,7 +15,8 @@ All coordinates are computed in the active view plane (Right/Up directions).
 """
 
 from Autodesk.Revit.DB import (
-    XYZ, Transaction, ElementTransformUtils, IndependentTag, TextNote,
+    XYZ, Transaction, SubTransaction, ElementTransformUtils, IndependentTag, TextNote,
+    BuiltInParameter,
     ElementId, View, ElementType, FilteredElementCollector,
 )
 from Autodesk.Revit.UI.Selection import ObjectType, ISelectionFilter
@@ -36,7 +37,9 @@ __author__ = "Tu Thanh Nhan"
 
 EPS = 1e-9
 MM_TO_FT = 1.0 / 304.8
-GAP_MM = 0.2          # paper gap used by Stack Vertical and Untangle
+GAP_RATIO = 0.10      # gap = 10% of the text height (Stack Vertical, Untangle)
+LAYOUT_TOL = 1e-4     # ft (~0.03 mm) - layout is considered settled below this
+LAYOUT_MAX_PASSES = 4 # measure -> move -> re-measure passes
 TITLE = "Vsgn-Align"
 
 
@@ -175,6 +178,14 @@ def _quiet(t):
         t.SetFailureHandlingOptions(opts)
     except Exception:
         pass
+
+
+def _temp_tx(doc, inside):
+    if inside:
+        return SubTransaction(doc)
+    t = Transaction(doc, "Vsgn-Align - measure")
+    _quiet(t)
+    return t
 
 
 def _rollback(t):
@@ -332,14 +343,13 @@ def _move_tag(tag, v):
 # --------------------------------------------------------------------------
 # Measuring: boxes of the text part only (leaders ignored)
 # --------------------------------------------------------------------------
-def _measure_leader_off(doc, view, frame, elements, boxes):
+def _measure_leader_off(doc, view, frame, elements, boxes, inside=False):
     targets = [e for e in elements
                if (_kind(e) == "tag" and _tag_has_leader(e))
                or (_kind(e) == "text" and _text_has_leader(e))]
     if not targets:
         return
-    t = Transaction(doc, "Vsgn-Align - measure")
-    _quiet(t)
+    t = _temp_tx(doc, inside)
     try:
         t.Start()
         for e in targets:
@@ -361,7 +371,7 @@ def _measure_leader_off(doc, view, frame, elements, boxes):
         _rollback(t)
 
 
-def _measure_spots(doc, view, frame, spots, boxes):
+def _measure_spots(doc, view, frame, spots, boxes, inside=False):
     """Shift the spot text far away (+D, then -D) inside rolled-back transactions.
     The far side of the bounding box then belongs to the text only."""
     if not spots:
@@ -374,8 +384,7 @@ def _measure_spots(doc, view, frame, spots, boxes):
 
     results = {}
     for sign in (1.0, -1.0):
-        t = Transaction(doc, "Vsgn-Align - measure")
-        _quiet(t)
+        t = _temp_tx(doc, inside)
         try:
             t.Start()
             moved = []
@@ -402,19 +411,19 @@ def _measure_spots(doc, view, frame, spots, boxes):
                 boxes[_key(e)] = box
 
 
-def measure(doc, view, frame, elements):
+def measure(doc, view, frame, elements, inside=False):
     boxes = {}
     for e in elements:
         b = box2d(e, view, frame)
         if b is not None:
             boxes[_key(e)] = b
-    _measure_leader_off(doc, view, frame, elements, boxes)
-    _measure_spots(doc, view, frame, [e for e in elements if _kind(e) == "spot"], boxes)
+    _measure_leader_off(doc, view, frame, elements, boxes, inside)
+    _measure_spots(doc, view, frame, [e for e in elements if _kind(e) == "spot"], boxes, inside)
     return boxes
 
 
-def _make_items(doc, view, frame, elements):
-    boxes = measure(doc, view, frame, elements)
+def _make_items(doc, view, frame, elements, inside=False):
+    boxes = measure(doc, view, frame, elements, inside)
     return [Item(e, _kind(e), boxes[_key(e)]) for e in elements if _key(e) in boxes]
 
 
@@ -462,6 +471,10 @@ def _apply(doc, items, frame, name, pre_action=None):
         _rollback(t)
         forms.alert("Command failed:\n{}".format(ex), title=TITLE)
         return
+    _report_failures(failed, spot_failed)
+
+
+def _report_failures(failed, spot_failed):
     msgs = []
     if failed:
         msgs.append("{} element(s) could not be moved and were skipped.".format(failed))
@@ -568,19 +581,112 @@ def distribute(direction):
     _apply(doc, items, frame, "Vsgn-Align - Distribute " + direction.capitalize())
 
 
-def stack_vertical(gap_mm=GAP_MM):
-    """Stack elements top-down with a fixed paper gap; the top element stays."""
+def stack_vertical():
+    """Stack elements top-down without overlapping; gap = 10% of the text height.
+    The top element stays in place, horizontal positions are unchanged."""
     res = _collect("Select elements to stack, then click Finish", 2)
     if res is None:
         return
     doc, view, frame, items = res
-    gap = gap_mm * MM_TO_FT * _scale(view)
-    seq = sorted(items, key=lambda i: -i.cy)
-    cursor = seq[0].min_y - gap
-    for i in seq[1:]:
-        i.dy = cursor - i.max_y
-        cursor -= i.h + gap
-    _apply(doc, items, frame, "Vsgn-Align - Stack Vertical")
+    order = sorted(items, key=lambda i: -i.cy)
+    _sequence_layout(doc, view, frame, items, order, "vertical",
+                     "Vsgn-Align - Stack Vertical")
+
+
+def _text_size(element, view):
+    """Printed text height in model units (type 'Text Size' x view scale),
+    or None when the element has no Text Size (e.g. tags)."""
+    try:
+        etype = element.Document.GetElement(element.GetTypeId())
+        if etype is None:
+            return None
+        p = etype.get_Parameter(BuiltInParameter.TEXT_SIZE)
+        if p is None or not p.HasValue:
+            p = etype.LookupParameter("Text Size")
+        if p is not None and p.HasValue and p.AsDouble() > EPS:
+            return p.AsDouble() * _scale(view)
+    except Exception:
+        pass
+    return None
+
+
+def _glyph_pad(item, ts):
+    """Empty space Revit keeps above and below the letters inside the text box.
+    The visible letters are ts high, centred in the box. Only applied to single-line
+    texts; multi-line texts (box > 2.2 x ts) keep their box."""
+    if ts is None:
+        return 0.0
+    if ts < item.h < 2.2 * ts:
+        return (item.h - ts) / 2.0
+    return 0.0
+
+
+def _glyph_top(item, ts):
+    return item.max_y - _glyph_pad(item, ts)
+
+
+def _place_sequence(seq, direction, start, gap, sizes):
+    """Vertical: gap measured between the visible letters (box padding removed).
+    Horizontal: gap measured between the text boxes."""
+    cursor = start
+    if direction == "vertical":
+        for i in seq:
+            ts = sizes.get(_key(i.element))
+            pad = _glyph_pad(i, ts)
+            i.dx, i.dy = 0.0, cursor - (i.max_y - pad)
+            cursor -= (i.h - 2.0 * pad) + gap
+    else:
+        for i in seq:
+            i.dx, i.dy = cursor - i.min_x, 0.0
+            cursor += i.w + gap
+
+
+def _sequence_layout(doc, view, frame, items, order, direction, name):
+    """Place items one after another (top-down or left-right) in the given order
+    with gap = 10% of the largest text height (2 mm text -> 0.2 mm between the
+    letters on paper). After each pass the real sizes are
+    re-measured and the layout is corrected, so texts never overlap even when a
+    spot / tag changes its text box after its leader moves."""
+    sizes = dict((_key(i.element), _text_size(i.element, view)) for i in items)
+    heights = [sizes[_key(i.element)] or i.h for i in items]
+    gap = GAP_RATIO * max(heights)
+    if direction == "vertical":
+        start = max(_glyph_top(i, sizes[_key(i.element)]) for i in items)
+    else:
+        start = min(i.min_x for i in items)
+    order_keys = [_key(i.element) for i in order]
+    elements = [i.element for i in items]
+    failed, spot_failed = set(), set()
+
+    t = Transaction(doc, name)
+    t.Start()
+    try:
+        current = items
+        for _ in range(LAYOUT_MAX_PASSES):
+            by_key = dict((_key(i.element), i) for i in current)
+            seq = [by_key[k] for k in order_keys if k in by_key]
+            _place_sequence(seq, direction, start, gap, sizes)
+            moving = [i for i in seq
+                      if (abs(i.dx) > LAYOUT_TOL or abs(i.dy) > LAYOUT_TOL)
+                      and _key(i.element) not in failed
+                      and _key(i.element) not in spot_failed]
+            if not moving:
+                break
+            for i in moving:
+                try:
+                    _move(doc, i, frame)
+                except _SpotNotMovable:
+                    spot_failed.add(_key(i.element))
+                except Exception:
+                    failed.add(_key(i.element))
+            doc.Regenerate()
+            current = _make_items(doc, view, frame, elements, inside=True)
+        t.Commit()
+    except Exception as ex:
+        _rollback(t)
+        forms.alert("Command failed:\n{}".format(ex), title=TITLE)
+        return
+    _report_failures(len(failed), len(spot_failed))
 
 
 def _scale(view):
@@ -683,23 +789,14 @@ def untangle(direction):
         forms.alert("Select at least 2 tags or spot elevations.", title=TITLE)
         return
 
-    gap = GAP_MM * MM_TO_FT * _scale(view)
     if direction == "vertical":
-        # Order by leader target (top -> bottom), stack texts from the top edge
-        # of the group with a fixed gap. Horizontal positions stay unchanged.
-        cursor = max(i.max_y for i in items)
-        for i in sorted(items, key=lambda i: -i.anchor[1]):
-            i.dy = cursor - i.max_y
-            cursor -= i.h + gap
+        # leader targets top -> bottom, texts stacked from the top edge of the group
+        order = sorted(items, key=lambda i: -i.anchor[1])
     else:
-        # Order by leader target (left -> right), line texts up from the left edge
-        # of the group with a fixed gap. Vertical positions stay unchanged.
-        cursor = min(i.min_x for i in items)
-        for i in sorted(items, key=lambda i: i.anchor[0]):
-            i.dx = cursor - i.min_x
-            cursor += i.w + gap
-
-    _apply(doc, items, frame, "Vsgn-Align - Untangle " + direction.capitalize())
+        # leader targets left -> right, texts lined up from the left edge of the group
+        order = sorted(items, key=lambda i: i.anchor[0])
+    _sequence_layout(doc, view, frame, items, order, direction,
+                     "Vsgn-Align - Untangle " + direction.capitalize())
 
 
 # --------------------------------------------------------------------------
