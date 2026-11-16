@@ -34,7 +34,7 @@ except Exception:
 from pyrevit import revit, forms
 
 __author__ = "Tu Thanh Nhan"
-__version__ = "1.104"   # +0.001 per release; after 1.199 -> 2.000
+__version__ = "1.105"   # +0.001 per release; after 1.199 -> 2.000
 
 EPS = 1e-9
 MM_TO_FT = 1.0 / 304.8
@@ -688,6 +688,8 @@ def _sequence_layout(doc, view, frame, items, order, direction, name, align=None
     else:
         start = min(i.min_x for i in items)
     target = _align_target(items, align, sizes)
+    if callable(order):
+        order = order(items, direction, start, gap, sizes, align, target)
     order_keys = [_key(i.element) for i in order]
     elements = [i.element for i in items]
     failed, spot_failed = set(), set()
@@ -824,16 +826,183 @@ def untangle(direction, align=None):
         forms.alert("Select at least 2 tags or spot elevations.", title=TITLE)
         return
 
-    if direction == "vertical":
-        # leader targets top -> bottom, texts stacked from the top edge of the group
-        order = sorted(items, key=lambda i: -i.anchor[1])
-    else:
-        # leader targets left -> right, texts lined up from the left edge of the group
-        order = sorted(items, key=lambda i: i.anchor[0])
+    for i in items:
+        i.leader = leader_geometry(doc, i.element, frame, i.anchor)
     name = "Vsgn-Align - Untangle " + direction.capitalize()
     if align:
         name += " + Align " + align.capitalize()
-    _sequence_layout(doc, view, frame, items, order, direction, name, align)
+    _sequence_layout(doc, view, frame, items, _best_order, direction, name, align)
+
+
+# --------------------------------------------------------------------------
+# Leader geometry & crossing-free ordering
+# --------------------------------------------------------------------------
+def _pt2d(frame, p):
+    return frame.to2d(p) if p is not None else None
+
+
+def leader_geometry(doc, e, frame, anchor):
+    """Leader polyline split into (fixed start point, [points that move with the text]).
+    Spot: origin -> shoulder -> leader end.  Tag: target -> elbow -> head."""
+    moving = []
+    if _is_spot(e):
+        if not _spot_has_leader(e):
+            return None
+        try:
+            fixed = frame.to2d(e.Origin)
+        except Exception:
+            fixed = anchor
+        try:
+            if e.LeaderHasShoulder:
+                moving.append(_pt2d(frame, e.LeaderShoulderPosition))
+        except Exception:
+            pass
+        try:
+            moving.append(_pt2d(frame, e.LeaderEndPosition))
+        except Exception:
+            pass
+    elif _is_tag(e):
+        if not _tag_has_leader(e):
+            return None
+        fixed = anchor
+        try:  # Revit 2022+
+            for r in e.GetTaggedReferences():
+                try:
+                    if e.HasLeaderElbow(r):
+                        moving.append(_pt2d(frame, e.GetLeaderElbow(r)))
+                        break
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        if not moving:
+            try:  # Revit <= 2021
+                if e.HasElbow:
+                    moving.append(_pt2d(frame, e.LeaderElbow))
+            except Exception:
+                pass
+        try:
+            moving.append(_pt2d(frame, e.TagHeadPosition))
+        except Exception:
+            pass
+    else:
+        return None
+    moving = [m for m in moving if m is not None]
+    if fixed is None or not moving:
+        return None
+    return (fixed, moving)
+
+
+def _orient(a, b, c):
+    return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+
+
+def _seg_cross(p1, p2, q1, q2):
+    d1 = _orient(q1, q2, p1)
+    d2 = _orient(q1, q2, p2)
+    d3 = _orient(p1, p2, q1)
+    d4 = _orient(p1, p2, q2)
+    return d1 * d2 < 0 and d3 * d4 < 0
+
+
+def _seg_hits_box(p, q, box):
+    x0, y0, x1, y1 = box
+    for (x, y) in (p, q):
+        if x0 < x < x1 and y0 < y < y1:
+            return True
+    corners = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
+    for k in range(4):
+        if _seg_cross(p, q, corners[k], corners[(k + 1) % 4]):
+            return True
+    return False
+
+
+def _crossings(seq):
+    """Number of leader/leader and leader/text crossings for the planned dx, dy."""
+    polys, boxes = [], []
+    for i in seq:
+        if getattr(i, "leader", None):
+            fixed, moving = i.leader
+            polys.append([fixed] + [(x + i.dx, y + i.dy) for (x, y) in moving])
+        else:
+            polys.append(None)
+        sx, sy = i.w * 0.05, i.h * 0.15            # ignore the empty margin of the box
+        boxes.append((i.min_x + i.dx + sx, i.min_y + i.dy + sy,
+                      i.max_x + i.dx - sx, i.max_y + i.dy - sy))
+    count = 0
+    n = len(seq)
+    for a in range(n):
+        pa = polys[a]
+        if pa is None:
+            continue
+        segs_a = list(zip(pa[:-1], pa[1:]))
+        for b in range(n):
+            if b == a:
+                continue
+            for (p, q) in segs_a:
+                if _seg_hits_box(p, q, boxes[b]):
+                    count += 1
+            pb = polys[b]
+            if b > a and pb is not None:
+                for (p, q) in segs_a:
+                    for (r, s2) in zip(pb[:-1], pb[1:]):
+                        if _seg_cross(p, q, r, s2):
+                            count += 1
+    return count
+
+
+def _best_order(items, direction, start, gap, sizes, align, target):
+    """Pick the order with the fewest crossings. Exhaustive for up to 7 labels,
+    otherwise best simple order improved by neighbour swaps. Ties keep the order
+    closest to the leader targets (top -> bottom / left -> right)."""
+    if direction == "vertical":
+        base = sorted(items, key=lambda i: -i.anchor[1])
+    else:
+        base = sorted(items, key=lambda i: i.anchor[0])
+    rank = dict((id(i), k) for k, i in enumerate(base))
+
+    def cost(seq):
+        _place_sequence(seq, direction, start, gap, sizes, align, target)
+        inversions = 0
+        for a in range(len(seq)):
+            for b in range(a + 1, len(seq)):
+                if rank[id(seq[a])] > rank[id(seq[b])]:
+                    inversions += 1
+        return _crossings(seq) * 1000 + inversions
+
+    best, best_cost = list(base), cost(list(base))
+    if best_cost < 1000:
+        return best
+
+    if len(items) <= 7:
+        import itertools
+        for perm in itertools.permutations(base):
+            c = cost(list(perm))
+            if c < best_cost:
+                best, best_cost = list(perm), c
+                if c < 1000 and c == 0:
+                    break
+        return best
+
+    candidates = [list(base), list(reversed(base)),
+                  sorted(items, key=lambda i: i.anchor[0]),
+                  sorted(items, key=lambda i: -i.anchor[0]),
+                  sorted(items, key=lambda i: i.anchor[1]),
+                  sorted(items, key=lambda i: -i.anchor[1])]
+    for cand in candidates:
+        c = cost(cand)
+        if c < best_cost:
+            best, best_cost = cand, c
+    improved, rounds = True, 0
+    while improved and rounds < 50:
+        improved, rounds = False, rounds + 1
+        for k in range(len(best) - 1):
+            trial = list(best)
+            trial[k], trial[k + 1] = trial[k + 1], trial[k]
+            c = cost(trial)
+            if c < best_cost:
+                best, best_cost, improved = trial, c, True
+    return best
 
 
 # --------------------------------------------------------------------------
