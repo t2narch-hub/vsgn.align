@@ -1,7 +1,7 @@
 # Vsgn-Align – pyRevit extension
 
 **Author:** Tu Thanh Nhan  
-**Version:** 1.103
+**Version:** 1.104
 
 Align, distribute, stack, untangle and arrange model elements, tags, text notes,
 spot elevations and viewports in Revit.
@@ -19,13 +19,17 @@ spot elevations and viewports in Revit.
 | | Align Center | Align Middle | Distribute Vertical |
 | | Align Right | Align Bottom | Stack Vertical |
 
-| Panel | Command | Description |
-|---|---|---|
-| Tags | Arrange | Place tags around the view crop region (Left & Right / Top & Bottom / All sides) |
-| Tags | Untangle Vertical / Horizontal | Reorder tags or spot elevations so their leaders do not cross, then space the texts 15% of the text height apart |
-| Tags | Untangle V + Left / Right | Untangle Vertical, then line the texts up on their left / right edges |
-| Tags | Untangle H + Top / Bottom | Untangle Horizontal, then line the texts up on the top / bottom of their letters |
-| Tags | About | Show Vsgn-Align version, author and Revit version (include it when reporting problems) |
+| Panel | Column 1 | Column 2 | Column 3 |
+|---|---|---|---|
+| Tags | Untangle Vertical | Untangle Horizontal | Arrange |
+| | Untangle V + Left | Untangle H + Top | Settings |
+| | Untangle V + Right | Untangle H + Bottom | About |
+
+* **Untangle**: reorder tags / spot elevations so their leaders do not cross, then space the texts.
+  *+ Left / Right* lines the texts up on their left / right edges, *+ Top / Bottom* on the top / bottom of the letters.
+* **Arrange**: place tags around the view crop region (Left & Right / Top & Bottom / All sides).
+* **Settings**: gap between texts in % of the text height (default 15%), saved per user.
+* **About**: Vsgn-Align version, author and Revit version (include it when reporting problems).
 
 Select elements first and click a command, or click a command, pick elements and press **Finish**.
 
@@ -61,6 +65,7 @@ pyrevit extensions delete VsgnAlign
 
 ## Changelog
 
+* **1.104** – Tags panel as a 3 x 3 grid, new Settings button (gap %), renamed button folders to avoid duplicate buttons.
 * **1.103** – New: Untangle V + Left/Right, Untangle H + Top/Bottom. Gap = 15% of the text height. About shows the version correctly (version stored in vsgnalign_core.py and extension.json).
 * **1.102** – Vertical gap measured between the visible letters, not the Revit text box (2 mm text -> 0.2 mm gap on paper).
 * **1.101** – Stack Vertical / Untangle: no overlapping texts, gap = 10% of the text height, re-measure and correct after moving.

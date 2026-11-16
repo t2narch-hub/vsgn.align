@@ -1,0 +1,5 @@
+title: "Settings"
+tooltip: |
+  Change the gap between texts used by Stack Vertical and Untangle
+  (% of the text height, default 15%). Saved per user.
+author: Tu Thanh Nhan
