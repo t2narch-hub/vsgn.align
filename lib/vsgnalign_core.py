@@ -36,6 +36,7 @@ __author__ = "Tu Thanh Nhan"
 
 EPS = 1e-9
 MM_TO_FT = 1.0 / 304.8
+GAP_MM = 0.2          # paper gap used by Stack Vertical and Untangle
 TITLE = "Vsgn-Align"
 
 
@@ -243,7 +244,37 @@ def _filter_movable(elements):
 # --------------------------------------------------------------------------
 # Spot dimensions: move only the text (leader end + shoulder), never the origin
 # --------------------------------------------------------------------------
+def _close(a, b, tol=1e-6):
+    return a is not None and b is not None and a.DistanceTo(b) < tol
+
+
 def _move_spot(spot, v):
+    """Move the spot text by v. Leader end + shoulder move together with the text;
+    the measured point (origin) never moves."""
+    old_text = None
+    try:
+        old_text = spot.TextPosition                         # Revit 2021+
+    except Exception:
+        pass
+    if _move_spot_leader(spot, v):
+        # Make sure the text followed the leader; if not, move it explicitly.
+        if old_text is not None:
+            target = old_text.Add(v)
+            try:
+                spot.Document.Regenerate()
+                if not _close(spot.TextPosition, target):
+                    spot.TextPosition = target
+            except Exception:
+                pass
+        return True
+    try:
+        spot.TextPosition = spot.TextPosition.Add(v)
+        return True
+    except Exception:
+        return False
+
+
+def _move_spot_leader(spot, v):
     if _spot_has_leader(spot):
         try:
             end = spot.LeaderEndPosition                    # Revit 2021+
@@ -260,11 +291,42 @@ def _move_spot(spot, v):
             return True
         except Exception:
             pass
-    try:
-        spot.TextPosition = spot.TextPosition.Add(v)        # Revit 2021+
-        return True
+    return False
+
+
+def _move_tag(tag, v):
+    """Move the tag head by v; leader elbows move with it so the leader keeps its
+    shape. Attached / free leader ends stay where they are."""
+    elbows = []
+    try:  # Revit 2022+: one elbow per tagged reference
+        for r in tag.GetTaggedReferences():
+            try:
+                if tag.HasLeaderElbow(r):
+                    elbows.append((r, tag.GetLeaderElbow(r)))
+            except Exception:
+                pass
     except Exception:
-        return False
+        pass
+    old_elbow = None
+    if not elbows:
+        try:  # Revit <= 2021
+            if tag.HasElbow:
+                old_elbow = tag.LeaderElbow
+        except Exception:
+            old_elbow = None
+
+    tag.TagHeadPosition = tag.TagHeadPosition.Add(v)
+
+    for r, p in elbows:
+        try:
+            tag.SetLeaderElbow(r, p.Add(v))
+        except Exception:
+            pass
+    if old_elbow is not None:
+        try:
+            tag.LeaderElbow = old_elbow.Add(v)
+        except Exception:
+            pass
 
 
 # --------------------------------------------------------------------------
@@ -374,7 +436,7 @@ def _move(doc, item, frame):
         return
     if item.kind == "tag":
         try:
-            e.TagHeadPosition = e.TagHeadPosition.Add(v)
+            _move_tag(e, v)
             return
         except Exception:
             pass
@@ -506,7 +568,7 @@ def distribute(direction):
     _apply(doc, items, frame, "Vsgn-Align - Distribute " + direction.capitalize())
 
 
-def stack_vertical(gap_mm=1.5):
+def stack_vertical(gap_mm=GAP_MM):
     """Stack elements top-down with a fixed paper gap; the top element stays."""
     res = _collect("Select elements to stack, then click Finish", 2)
     if res is None:
@@ -621,14 +683,21 @@ def untangle(direction):
         forms.alert("Select at least 2 tags or spot elevations.", title=TITLE)
         return
 
+    gap = GAP_MM * MM_TO_FT * _scale(view)
     if direction == "vertical":
-        slots = sorted([i.cy for i in items], reverse=True)
-        for slot, i in zip(slots, sorted(items, key=lambda i: -i.anchor[1])):
-            i.dy = slot - i.cy
+        # Order by leader target (top -> bottom), stack texts from the top edge
+        # of the group with a fixed gap. Horizontal positions stay unchanged.
+        cursor = max(i.max_y for i in items)
+        for i in sorted(items, key=lambda i: -i.anchor[1]):
+            i.dy = cursor - i.max_y
+            cursor -= i.h + gap
     else:
-        slots = sorted([i.cx for i in items])
-        for slot, i in zip(slots, sorted(items, key=lambda i: i.anchor[0])):
-            i.dx = slot - i.cx
+        # Order by leader target (left -> right), line texts up from the left edge
+        # of the group with a fixed gap. Vertical positions stay unchanged.
+        cursor = min(i.min_x for i in items)
+        for i in sorted(items, key=lambda i: i.anchor[0]):
+            i.dx = cursor - i.min_x
+            cursor += i.w + gap
 
     _apply(doc, items, frame, "Vsgn-Align - Untangle " + direction.capitalize())
 

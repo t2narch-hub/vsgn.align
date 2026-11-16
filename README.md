@@ -21,14 +21,15 @@ spot elevations and viewports in Revit.
 | Panel | Command | Description |
 |---|---|---|
 | Tags | Arrange | Place tags around the view crop region (Left & Right / Top & Bottom / All sides) |
-| Tags | Untangle Vertical / Horizontal | Reorder tags or spot elevations so their leaders do not cross |
+| Tags | Untangle Vertical / Horizontal | Reorder tags or spot elevations so their leaders do not cross, then space the texts 0.2 mm apart |
 | Tags | About | Show Revit / pyRevit / Python versions (include it when reporting problems) |
 
 Select elements first and click a command, or click a command, pick elements and press **Finish**.
 
 Notes:
 * Tags and text notes are measured **without their leaders**, so the text itself is aligned.
-* Tags move through *TagHeadPosition*; attached or free leader ends stay where they are.
+* Tags move through *TagHeadPosition*; leader elbows move with the text, attached or free leader ends stay.
+* Stack Vertical and Untangle use a 0.2 mm paper gap (scaled by the view scale).
 * **Spot elevations / coordinates / slopes**: only the text moves (leader end and shoulder);
   the measured point never moves, so the value stays correct. Requires Revit 2021 or newer.
 * Pinned and grouped elements are skipped.
