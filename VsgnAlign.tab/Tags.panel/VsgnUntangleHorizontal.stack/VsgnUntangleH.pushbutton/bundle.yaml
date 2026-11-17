@@ -1,5 +1,5 @@
 title: "Untangle Horizontal"
 tooltip: |
-  Reorder a row of tags / spot elevations so their leaders do not cross,
+  Reorder a row of tags / spot elevations / text notes so their leaders do not cross,
   then line up the texts with a gap of 15% of the text height.
 author: Tu Thanh Nhan

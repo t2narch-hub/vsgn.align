@@ -34,7 +34,7 @@ except Exception:
 from pyrevit import revit, forms
 
 __author__ = "Tu Thanh Nhan"
-__version__ = "1.105"   # +0.001 per release; after 1.199 -> 2.000
+__version__ = "1.106"   # +0.001 per release; after 1.199 -> 2.000
 
 EPS = 1e-9
 MM_TO_FT = 1.0 / 304.8
@@ -208,7 +208,7 @@ def _is_candidate(e):
 
 
 def _is_leader_annotation(e):
-    return _is_tag(e) or _is_spot(e)
+    return _is_tag(e) or _is_spot(e) or isinstance(e, TextNote)
 
 
 class _PickFilter(ISelectionFilter):
@@ -413,6 +413,47 @@ def _measure_spots(doc, view, frame, spots, boxes, inside=False):
                 boxes[_key(e)] = box
 
 
+def _text_note_box(note, view, frame, measured):
+    """Box of the text content of a text note from its alignment point (Coord),
+    Width / Height and alignment - leaders are never included. Width / Height are
+    paper units, so they are scaled by the view scale; the result is checked
+    against the box Revit reports and rejected when it does not fit."""
+    try:
+        coord = note.Coord
+        width = note.Width
+        height = note.Height
+        base = note.BaseDirection.Normalize()
+        up = note.UpDirection.Normalize()
+    except Exception:
+        return None
+    if width <= EPS or height <= EPS:
+        return None
+    halign = str(getattr(note, "HorizontalAlignment", "Left"))
+    valign = str(getattr(note, "VerticalAlignment", "Top"))
+    for factor in (float(_scale(view)), 1.0):
+        w, h = width * factor, height * factor
+        left = {"Center": -w / 2.0, "Right": -w}.get(halign, 0.0)
+        top = {"Middle": h / 2.0, "Bottom": h}.get(valign, 0.0)
+        xs, ys = [], []
+        for bx in (left, left + w):
+            for by in (top - h, top):
+                p = coord.Add(base.Multiply(bx)).Add(up.Multiply(by))
+                u, v = frame.to2d(p)
+                xs.append(u)
+                ys.append(v)
+        box = (min(xs), min(ys), max(xs), max(ys))
+        if measured is None:
+            return box
+        # Height must fit inside the reported box (which may include leaders);
+        # horizontally the boxes only need to overlap (Width is the wrap width).
+        tol = 0.05 * (measured[3] - measured[1]) + EPS
+        fits_v = box[1] >= measured[1] - tol and box[3] <= measured[3] + tol
+        overlaps_h = box[0] < measured[2] and box[2] > measured[0]
+        if fits_v and overlaps_h:
+            return box
+    return None
+
+
 def measure(doc, view, frame, elements, inside=False):
     boxes = {}
     for e in elements:
@@ -421,6 +462,11 @@ def measure(doc, view, frame, elements, inside=False):
             boxes[_key(e)] = b
     _measure_leader_off(doc, view, frame, elements, boxes, inside)
     _measure_spots(doc, view, frame, [e for e in elements if _kind(e) == "spot"], boxes, inside)
+    for e in elements:
+        if _kind(e) == "text":
+            b = _text_note_box(e, view, frame, boxes.get(_key(e)))
+            if b is not None:
+                boxes[_key(e)] = b
     return boxes
 
 
@@ -451,7 +497,44 @@ def _move(doc, item, frame):
             return
         except Exception:
             pass
+    if item.kind == "text":
+        _move_text(doc, e, v)
+        return
     ElementTransformUtils.MoveElement(doc, e.Id, v)
+
+
+def _text_leaders(note):
+    try:
+        return list(note.GetLeaders())
+    except Exception:
+        return []
+
+
+def _move_text(doc, note, v):
+    """Move the text; leader arrow points stay, leader elbows move with the text."""
+    saved = []
+    for ld in _text_leaders(note):
+        try:
+            saved.append((ld.End, ld.Elbow))
+        except Exception:
+            saved.append((None, None))
+    ElementTransformUtils.MoveElement(doc, note.Id, v)
+    if not saved:
+        return
+    leaders = _text_leaders(note)
+    if len(leaders) != len(saved):
+        return
+    for ld, (end, elbow) in zip(leaders, saved):
+        try:
+            if elbow is not None:
+                ld.Elbow = elbow.Add(v)
+        except Exception:
+            pass
+        try:
+            if end is not None:
+                ld.End = end
+        except Exception:
+            pass
 
 
 def _apply(doc, items, frame, name, pre_action=None):
@@ -616,7 +699,7 @@ def _glyph_pad(item, ts):
     """Empty space Revit keeps above and below the letters inside the text box.
     The visible letters are ts high, centred in the box. Only applied to single-line
     texts; multi-line texts (box > 2.2 x ts) keep their box."""
-    if ts is None:
+    if ts is None or item.kind != "spot":
         return 0.0
     if ts < item.h < 2.2 * ts:
         return (item.h - ts) / 2.0
@@ -784,6 +867,14 @@ def _free_leader_end(tag):
 
 
 def anchor_of(doc, e, view, frame):
+    if isinstance(e, TextNote):
+        for ld in _text_leaders(e):
+            try:
+                return frame.to2d(ld.End)
+            except Exception:
+                pass
+        b = box2d(e, view, frame)
+        return ((b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0) if b else None
     if _is_spot(e):
         try:
             return frame.to2d(e.Origin)
@@ -814,7 +905,7 @@ def anchor_of(doc, e, view, frame):
 def untangle(direction, align=None):
     """direction: vertical (column of labels) | horizontal (row of labels)
     align: None, or 'left' / 'right' for vertical, 'top' / 'bottom' for horizontal."""
-    res = _collect("Select tags or spot elevations to untangle, then click Finish",
+    res = _collect("Select tags, spot elevations or text notes to untangle, then click Finish",
                    2, annotations_only=True)
     if res is None:
         return
@@ -823,7 +914,7 @@ def untangle(direction, align=None):
         i.anchor = anchor_of(doc, i.element, view, frame)
     items = [i for i in items if i.anchor is not None]
     if len(items) < 2:
-        forms.alert("Select at least 2 tags or spot elevations.", title=TITLE)
+        forms.alert("Select at least 2 tags, spot elevations or text notes.", title=TITLE)
         return
 
     for i in items:
@@ -859,6 +950,23 @@ def leader_geometry(doc, e, frame, anchor):
             pass
         try:
             moving.append(_pt2d(frame, e.LeaderEndPosition))
+        except Exception:
+            pass
+    elif isinstance(e, TextNote):
+        leaders = _text_leaders(e)
+        if not leaders:
+            return None
+        ld = leaders[0]
+        try:
+            fixed = frame.to2d(ld.End)
+        except Exception:
+            return None
+        try:
+            moving.append(_pt2d(frame, ld.Elbow))
+        except Exception:
+            pass
+        try:
+            moving.append(_pt2d(frame, ld.Anchor))
         except Exception:
             pass
     elif _is_tag(e):
