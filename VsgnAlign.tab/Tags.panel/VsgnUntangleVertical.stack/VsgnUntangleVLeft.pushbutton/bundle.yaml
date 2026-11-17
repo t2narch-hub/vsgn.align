@@ -2,4 +2,5 @@ title: "Untangle V + Left"
 tooltip: |
   Untangle Vertical, then line the texts up on their LEFT edges
   (texts of different lengths start at the same point).
+  Text notes are also set to Align Text Left.
 author: Tu Thanh Nhan

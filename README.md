@@ -1,7 +1,7 @@
 # Vsgn-Align – pyRevit extension
 
 **Author:** Tu Thanh Nhan  
-**Version:** 1.106
+**Version:** 1.107
 
 Align, distribute, stack, untangle and arrange model elements, tags, text notes,
 spot elevations and viewports in Revit.
@@ -65,6 +65,7 @@ pyrevit extensions delete VsgnAlign
 
 ## Changelog
 
+* **1.107** – Align Left / Right and Untangle V + Left / Right also apply Revit's Align Text Left / Right to text notes, so the lines inside multi-line notes line up too.
 * **1.106** – Text notes: Untangle support, size taken from the text itself (multi-line safe, leaders ignored), arrow points stay when the text moves.
 * **1.105** – Untangle checks the real leader shape (point -> elbow/shoulder -> text) and picks the order with the fewest leader crossings.
 * **1.104** – Tags panel as a 3 x 3 grid, new Settings button (gap %), renamed button folders to avoid duplicate buttons.

@@ -34,7 +34,7 @@ except Exception:
 from pyrevit import revit, forms
 
 __author__ = "Tu Thanh Nhan"
-__version__ = "1.106"   # +0.001 per release; after 1.199 -> 2.000
+__version__ = "1.107"   # +0.001 per release; after 1.199 -> 2.000
 
 EPS = 1e-9
 MM_TO_FT = 1.0 / 304.8
@@ -537,13 +537,15 @@ def _move_text(doc, note, v):
             pass
 
 
-def _apply(doc, items, frame, name, pre_action=None):
+def _apply(doc, items, frame, name, pre_action=None, recompute=None):
     failed, spot_failed = 0, 0
     t = Transaction(doc, name)
     t.Start()
     try:
         if pre_action is not None:
             pre_action()
+        if recompute is not None:
+            items = recompute()
         for it in items:
             try:
                 _move(doc, it, frame)
@@ -557,6 +559,39 @@ def _apply(doc, items, frame, name, pre_action=None):
         forms.alert("Command failed:\n{}".format(ex), title=TITLE)
         return
     _report_failures(failed, spot_failed)
+
+
+def _set_text_alignment(items, side):
+    """Same as Revit's 'Align Text Left / Right / Center' for every text note.
+    Returns True when at least one note was changed."""
+    try:
+        from Autodesk.Revit.DB import HorizontalTextAlignment
+        value = getattr(HorizontalTextAlignment, side.capitalize())
+    except Exception:
+        return False
+    changed = False
+    for i in items:
+        if i.kind != "text":
+            continue
+        try:
+            if i.element.HorizontalAlignment != value:
+                i.element.HorizontalAlignment = value
+                changed = True
+        except Exception:
+            pass
+    return changed
+
+
+def _remeasure(doc, view, frame, items):
+    """Measure again inside the open transaction; keep anchor / leader data."""
+    old = dict((_key(i.element), i) for i in items)
+    new = _make_items(doc, view, frame, [i.element for i in items], inside=True)
+    for i in new:
+        o = old.get(_key(i.element))
+        if o is not None:
+            i.anchor = o.anchor
+            i.leader = getattr(o, "leader", None)
+    return new
 
 
 def _report_failures(failed, spot_failed):
@@ -607,7 +642,30 @@ def align(mode):
     if res is None:
         return
     doc, view, frame, items = res
+    name = "Vsgn-Align - Align " + mode.capitalize()
 
+    if mode in ("left", "right") and any(i.kind == "text" for i in items):
+        # Text notes: first align the lines inside each note (Revit "Align Text
+        # Left / Right"), then measure again and line the notes up.
+        state = {"items": items}
+
+        def set_alignment():
+            if _set_text_alignment(items, mode):
+                doc.Regenerate()
+
+        def recompute():
+            new = _remeasure(doc, view, frame, state["items"])
+            _compute_align(new, mode)
+            return new
+
+        _apply(doc, items, frame, name, pre_action=set_alignment, recompute=recompute)
+        return
+
+    _compute_align(items, mode)
+    _apply(doc, items, frame, name)
+
+
+def _compute_align(items, mode):
     if mode == "left":
         target = min(i.min_x for i in items)
         for i in items:
@@ -634,8 +692,6 @@ def align(mode):
             i.dy = target - i.cy
     else:
         raise ValueError(mode)
-
-    _apply(doc, items, frame, "Vsgn-Align - Align " + mode.capitalize())
 
 
 # --------------------------------------------------------------------------
@@ -762,24 +818,33 @@ def _sequence_layout(doc, view, frame, items, order, direction, name, align=None
     with gap = 15% of the largest text height (2 mm text -> 0.3 mm between the
     letters on paper). After each pass the real sizes are
     re-measured and the layout is corrected, so texts never overlap even when a
-    spot / tag changes its text box after its leader moves."""
-    sizes = dict((_key(i.element), _text_size(i.element, view)) for i in items)
-    heights = [sizes[_key(i.element)] or i.h for i in items]
-    gap = gap_ratio() * max(heights)
-    if direction == "vertical":
-        start = max(_glyph_top(i, sizes[_key(i.element)]) for i in items)
-    else:
-        start = min(i.min_x for i in items)
-    target = _align_target(items, align, sizes)
-    if callable(order):
-        order = order(items, direction, start, gap, sizes, align, target)
-    order_keys = [_key(i.element) for i in order]
-    elements = [i.element for i in items]
-    failed, spot_failed = set(), set()
-
+    spot / tag changes its text box after its leader moves.
+    With align left / right, text notes also get Revit's Align Text Left / Right."""
     t = Transaction(doc, name)
     t.Start()
+    failed, spot_failed = set(), set()
     try:
+        if align in ("left", "right") and any(i.kind == "text" for i in items):
+            if _set_text_alignment(items, align):
+                doc.Regenerate()
+                items = _remeasure(doc, view, frame, items)
+                for i in items:
+                    if getattr(i, "leader", None) is not None:
+                        i.leader = leader_geometry(doc, i.element, frame, i.anchor)
+
+        sizes = dict((_key(i.element), _text_size(i.element, view)) for i in items)
+        heights = [sizes[_key(i.element)] or i.h for i in items]
+        gap = gap_ratio() * max(heights)
+        if direction == "vertical":
+            start = max(_glyph_top(i, sizes[_key(i.element)]) for i in items)
+        else:
+            start = min(i.min_x for i in items)
+        target = _align_target(items, align, sizes)
+        if callable(order):
+            order = order(items, direction, start, gap, sizes, align, target)
+        order_keys = [_key(i.element) for i in order]
+        elements = [i.element for i in items]
+
         current = items
         for _ in range(LAYOUT_MAX_PASSES):
             by_key = dict((_key(i.element), i) for i in current)
