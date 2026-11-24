@@ -34,12 +34,13 @@ except Exception:
 from pyrevit import revit, forms
 
 __author__ = "Tu Thanh Nhan"
-__version__ = "1.107"   # +0.001 per release; after 1.199 -> 2.000
+__version__ = "1.108"   # +0.001 per release; after 1.199 -> 2.000
 
 EPS = 1e-9
 MM_TO_FT = 1.0 / 304.8
 GAP_RATIO = 0.15      # default gap = 15% of the text height (changeable in Settings)
 CONFIG_SECTION = "VsgnAlign"
+MIN_SHOULDER_MM = 2.0  # shortest horizontal shoulder kept when a text moves
 LAYOUT_TOL = 1e-4     # ft (~0.03 mm) - layout is considered settled below this
 LAYOUT_MAX_PASSES = 4 # measure -> move -> re-measure passes
 TITLE = "Vsgn-Align"
@@ -261,15 +262,15 @@ def _close(a, b, tol=1e-6):
     return a is not None and b is not None and a.DistanceTo(b) < tol
 
 
-def _move_spot(spot, v):
-    """Move the spot text by v. Leader end + shoulder move together with the text;
-    the measured point (origin) never moves."""
+def _move_spot(spot, v, shoulder_v=None):
+    """Move the spot text by v (leader end follows). The shoulder point moves by
+    shoulder_v (default: v, i.e. rigid). The measured point (origin) never moves."""
     old_text = None
     try:
         old_text = spot.TextPosition                         # Revit 2021+
     except Exception:
         pass
-    if _move_spot_leader(spot, v):
+    if _move_spot_leader(spot, v, shoulder_v):
         # Make sure the text followed the leader; if not, move it explicitly.
         if old_text is not None:
             target = old_text.Add(v)
@@ -287,24 +288,61 @@ def _move_spot(spot, v):
         return False
 
 
-def _move_spot_leader(spot, v):
-    if _spot_has_leader(spot):
+def _move_spot_leader(spot, v, shoulder_v=None):
+    if not _spot_has_leader(spot):
+        return False
+    try:
+        end = spot.LeaderEndPosition                        # Revit 2021+
+        shoulder = None
         try:
-            end = spot.LeaderEndPosition                    # Revit 2021+
-            shoulder = None
-            try:
-                if spot.LeaderHasShoulder:
-                    shoulder = spot.LeaderShoulderPosition
-            except Exception:
-                shoulder = None
-            spot.LeaderEndPosition = end.Add(v)
-            if shoulder is not None:
-                spot.LeaderShoulderPosition = shoulder.Add(v)
-                spot.LeaderEndPosition = end.Add(v)
-            return True
+            if spot.LeaderHasShoulder:
+                shoulder = spot.LeaderShoulderPosition
         except Exception:
-            pass
-    return False
+            shoulder = None
+        spot.LeaderEndPosition = end.Add(v)
+        if shoulder is not None:
+            spot.LeaderShoulderPosition = shoulder.Add(shoulder_v if shoulder_v is not None else v)
+            spot.LeaderEndPosition = end.Add(v)
+        return True
+    except Exception:
+        return False
+
+
+def _min_shoulder(element):
+    try:
+        return MIN_SHOULDER_MM * MM_TO_FT * _scale(element.Document.ActiveView)
+    except Exception:
+        return MIN_SHOULDER_MM * MM_TO_FT
+
+
+def _elbow_shift(frame, elbow, attach, dx, dy, min_len):
+    """Shift for a leader elbow whose horizontal segment runs elbow -> attach point
+    (spot shoulder, text note leader) when the text moves by (dx, dy):
+    the elbow keeps its horizontal position and only follows dy, so the leader keeps
+    its shape. It is pushed sideways only when the segment would get shorter than
+    min_len or flip to the other side."""
+    ex, ey = frame.to2d(elbow)
+    ax, ay = frame.to2d(attach)
+    side = 1.0 if ax >= ex else -1.0
+    limit = min(min_len, side * (ax - ex))
+    new_ax = ax + dx
+    ddx = 0.0
+    if limit > 0 and side * (new_ax - ex) < limit:
+        ddx = (new_ax - side * limit) - ex
+    return frame.vec(ddx, dy)
+
+
+def _move_spot_text(spot, frame, dx, dy):
+    """Real move of a spot text: elbow (shoulder start) stays, shoulder stretches."""
+    v = frame.vec(dx, dy)
+    shoulder_v = None
+    try:
+        if _spot_has_leader(spot) and spot.LeaderHasShoulder:
+            shoulder_v = _elbow_shift(frame, spot.LeaderShoulderPosition,
+                                      spot.LeaderEndPosition, dx, dy, _min_shoulder(spot))
+    except Exception:
+        shoulder_v = None
+    return _move_spot(spot, v, shoulder_v)
 
 
 def _move_tag(tag, v):
@@ -373,32 +411,70 @@ def _measure_leader_off(doc, view, frame, elements, boxes, inside=False):
         _rollback(t)
 
 
+def _spot_leader_2d(spot, frame):
+    """(leader end, shoulder or None, origin) in view coordinates, or None."""
+    if not _spot_has_leader(spot):
+        return None
+    try:
+        end = frame.to2d(spot.LeaderEndPosition)
+    except Exception:
+        return None
+    shoulder = None
+    try:
+        if spot.LeaderHasShoulder:
+            shoulder = frame.to2d(spot.LeaderShoulderPosition)
+    except Exception:
+        shoulder = None
+    try:
+        origin = frame.to2d(spot.Origin)
+    except Exception:
+        origin = None
+    return (end, shoulder, origin)
+
+
 def _measure_spots(doc, view, frame, spots, boxes, inside=False):
-    """Shift the spot text far away (+D, then -D) inside rolled-back transactions.
-    The far side of the bounding box then belongs to the text only."""
+    """Box of the spot text only (no leader / shoulder / symbol).
+    The text is shifted far away in rolled-back transactions, always in the
+    direction its shoulder points (so the text never flips side):
+      shift A = (side*D, +D) -> far edge and top of the text,
+      shift B = (side*D, -D) -> bottom of the text.
+    The near edge of the text is where the shoulder ends (leader end)."""
     if not spots:
         return
-    dist = {}
+    plan = {}
     for e in spots:
         b = boxes.get(_key(e))
         size = max(b[2] - b[0], b[3] - b[1]) if b else 1.0
-        dist[_key(e)] = size * 4.0 + 10.0
+        dist = size * 4.0 + 10.0
+        info = _spot_leader_2d(e, frame)
+        side = 1.0
+        if info is not None:
+            end, shoulder, origin = info
+            ref = shoulder if shoulder is not None else origin
+            if ref is not None and end[0] < ref[0]:
+                side = -1.0
+        plan[_key(e)] = (dist, info, side)
 
     results = {}
-    for sign in (1.0, -1.0):
+    for shift in ("A", "B"):
         t = _temp_tx(doc, inside)
         try:
             t.Start()
             moved = []
             for e in spots:
-                d = dist[_key(e)] * sign
-                if _move_spot(e, frame.vec(d, d)):
+                dist, info, side = plan[_key(e)]
+                up = dist if shift == "A" else -dist
+                if info is not None:
+                    vec = frame.vec(side * dist, up)
+                else:  # no leader: the text moves alone
+                    vec = frame.vec(up, up)
+                if _move_spot(e, vec):
                     moved.append(e)
             doc.Regenerate()
             for e in moved:
                 b = box2d(e, view, frame)
                 if b is not None:
-                    results.setdefault(_key(e), {})[sign] = b
+                    results.setdefault(_key(e), {})[shift] = b
         except Exception:
             pass
         finally:
@@ -406,11 +482,22 @@ def _measure_spots(doc, view, frame, spots, boxes, inside=False):
 
     for e in spots:
         r = results.get(_key(e), {})
-        if 1.0 in r and -1.0 in r:
-            d = dist[_key(e)]
-            box = (r[-1.0][0] + d, r[-1.0][1] + d, r[1.0][2] - d, r[1.0][3] - d)
-            if box[0] < box[2] and box[1] < box[3]:
-                boxes[_key(e)] = box
+        if "A" not in r or "B" not in r:
+            continue
+        dist, info, side = plan[_key(e)]
+        a, b = r["A"], r["B"]
+        if info is not None:
+            top = a[3] - dist
+            bottom = b[1] + dist
+            near = info[0][0]
+            if side > 0:
+                box = (near, bottom, a[2] - dist, top)
+            else:
+                box = (a[0] + dist, bottom, near, top)
+        else:
+            box = (b[0] + dist, b[1] + dist, a[2] - dist, a[3] - dist)
+        if box[0] < box[2] and box[1] < box[3]:
+            boxes[_key(e)] = box
 
 
 def _text_note_box(note, view, frame, measured):
@@ -488,7 +575,7 @@ def _move(doc, item, frame):
     v = frame.vec(item.dx, item.dy)
     e = item.element
     if item.kind == "spot":
-        if not _move_spot(e, v):
+        if not _move_spot_text(e, frame, item.dx, item.dy):
             raise _SpotNotMovable()
         return
     if item.kind == "tag":
@@ -498,7 +585,7 @@ def _move(doc, item, frame):
         except Exception:
             pass
     if item.kind == "text":
-        _move_text(doc, e, v)
+        _move_text(doc, e, frame, item.dx, item.dy)
         return
     ElementTransformUtils.MoveElement(doc, e.Id, v)
 
@@ -510,24 +597,30 @@ def _text_leaders(note):
         return []
 
 
-def _move_text(doc, note, v):
-    """Move the text; leader arrow points stay, leader elbows move with the text."""
+def _move_text(doc, note, frame, dx, dy):
+    """Move the text; leader arrow points stay, leader elbows keep their horizontal
+    position (the horizontal segment to the text stretches)."""
+    v = frame.vec(dx, dy)
     saved = []
     for ld in _text_leaders(note):
         try:
-            saved.append((ld.End, ld.Elbow))
+            saved.append((ld.End, ld.Elbow, ld.Anchor))
         except Exception:
-            saved.append((None, None))
+            saved.append((None, None, None))
     ElementTransformUtils.MoveElement(doc, note.Id, v)
     if not saved:
         return
     leaders = _text_leaders(note)
     if len(leaders) != len(saved):
         return
-    for ld, (end, elbow) in zip(leaders, saved):
+    min_len = _min_shoulder(note)
+    for ld, (end, elbow, anchor) in zip(leaders, saved):
         try:
             if elbow is not None:
-                ld.Elbow = elbow.Add(v)
+                if anchor is not None:
+                    ld.Elbow = elbow.Add(_elbow_shift(frame, elbow, anchor, dx, dy, min_len))
+                else:
+                    ld.Elbow = elbow.Add(frame.vec(0.0, dy))
         except Exception:
             pass
         try:
@@ -1010,11 +1103,11 @@ def leader_geometry(doc, e, frame, anchor):
             fixed = anchor
         try:
             if e.LeaderHasShoulder:
-                moving.append(_pt2d(frame, e.LeaderShoulderPosition))
+                moving.append((_pt2d(frame, e.LeaderShoulderPosition), "y"))
         except Exception:
             pass
         try:
-            moving.append(_pt2d(frame, e.LeaderEndPosition))
+            moving.append((_pt2d(frame, e.LeaderEndPosition), "xy"))
         except Exception:
             pass
     elif isinstance(e, TextNote):
@@ -1027,11 +1120,11 @@ def leader_geometry(doc, e, frame, anchor):
         except Exception:
             return None
         try:
-            moving.append(_pt2d(frame, ld.Elbow))
+            moving.append((_pt2d(frame, ld.Elbow), "y"))
         except Exception:
             pass
         try:
-            moving.append(_pt2d(frame, ld.Anchor))
+            moving.append((_pt2d(frame, ld.Anchor), "xy"))
         except Exception:
             pass
     elif _is_tag(e):
@@ -1042,7 +1135,7 @@ def leader_geometry(doc, e, frame, anchor):
             for r in e.GetTaggedReferences():
                 try:
                     if e.HasLeaderElbow(r):
-                        moving.append(_pt2d(frame, e.GetLeaderElbow(r)))
+                        moving.append((_pt2d(frame, e.GetLeaderElbow(r)), "xy"))
                         break
                 except Exception:
                     pass
@@ -1051,16 +1144,16 @@ def leader_geometry(doc, e, frame, anchor):
         if not moving:
             try:  # Revit <= 2021
                 if e.HasElbow:
-                    moving.append(_pt2d(frame, e.LeaderElbow))
+                    moving.append((_pt2d(frame, e.LeaderElbow), "xy"))
             except Exception:
                 pass
         try:
-            moving.append(_pt2d(frame, e.TagHeadPosition))
+            moving.append((_pt2d(frame, e.TagHeadPosition), "xy"))
         except Exception:
             pass
     else:
         return None
-    moving = [m for m in moving if m is not None]
+    moving = [m for m in moving if m[0] is not None]
     if fixed is None or not moving:
         return None
     return (fixed, moving)
@@ -1096,7 +1189,10 @@ def _crossings(seq):
     for i in seq:
         if getattr(i, "leader", None):
             fixed, moving = i.leader
-            polys.append([fixed] + [(x + i.dx, y + i.dy) for (x, y) in moving])
+            pts = [fixed]
+            for (x, y), mode in moving:
+                pts.append((x + (i.dx if mode == "xy" else 0.0), y + i.dy))
+            polys.append(pts)
         else:
             polys.append(None)
         sx, sy = i.w * 0.05, i.h * 0.15            # ignore the empty margin of the box
