@@ -34,7 +34,7 @@ except Exception:
 from pyrevit import revit, forms
 
 __author__ = "Tu Thanh Nhan"
-__version__ = "1.108"   # +0.001 per release; after 1.199 -> 2.000
+__version__ = "1.109"   # +0.001 per release; after 1.199 -> 2.000
 
 EPS = 1e-9
 MM_TO_FT = 1.0 / 304.8
@@ -1195,9 +1195,13 @@ def _crossings(seq):
             polys.append(pts)
         else:
             polys.append(None)
-        sx, sy = i.w * 0.05, i.h * 0.15            # ignore the empty margin of the box
-        boxes.append((i.min_x + i.dx + sx, i.min_y + i.dy + sy,
-                      i.max_x + i.dx - sx, i.max_y + i.dy - sy))
+        boxes.append((i.min_x + i.dx, i.min_y + i.dy, i.max_x + i.dx, i.max_y + i.dy))
+    # Clearance: a leader passing through OR close beside the end of a text counts
+    # as a hit (boxes widened by half a text line). Vertically the boxes are shrunk
+    # a little so leaders running through the gap between two rows do not count.
+    line_h = min(i.h for i in seq) if seq else 0.0
+    cx, cy = 0.5 * line_h, 0.1 * line_h
+    boxes = [(b[0] - cx, b[1] + cy, b[2] + cx, b[3] - cy) for b in boxes]
     count = 0
     n = len(seq)
     for a in range(n):
